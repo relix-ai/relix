@@ -31,6 +31,13 @@ use crate::proxy::lifecycle::{
 use crate::proxy::protocols;
 use crate::proxy::state::ProxyState;
 
+/// Hard cap on the number of bytes accepted in an inbound request
+/// body. 16 MiB is generously above any legitimate Anthropic /
+/// OpenAI / Gemini request and well below default OS process memory
+/// pressure thresholds. Defends against attackers that try to
+/// exhaust memory by streaming a never-ending request body.
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Top-level axum handler. Wraps [`drive`] and converts internal
 /// errors into a structured 502.
 pub async fn proxy_handler(
@@ -70,7 +77,11 @@ async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response
     let protocol = protocols::select(&parts.uri);
     debug!(protocol = protocol.name(), uri = %parts.uri, "selected protocol");
 
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    // Hard cap on inbound request body size. LLM API calls do not
+    // legitimately exceed this; without it, an attacker can drive
+    // memory usage to the system limit by sending a never-ending
+    // request body.
+    let body_bytes = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await?;
 
     // Stage 1: request_filter
     match protocol

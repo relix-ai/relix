@@ -100,24 +100,75 @@ impl StreamEvent {
 /// Non-Anthropic providers may send frames without an `event:` line
 /// (OpenAI does this, using only `data:`). Such frames yield
 /// `event_name = ""` so callers can distinguish.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseFrameDecoder {
     buf: Vec<u8>,
+    /// Hard cap on internal buffer growth. A malicious upstream that
+    /// sends bytes without a frame separator could otherwise drive
+    /// us to OOM. When exceeded, the buffer is reset and a
+    /// [`SseDecoderError::FrameTooLarge`] is reported through
+    /// [`Self::next_frame`] returning a synthetic error frame.
+    max_frame_bytes: usize,
 }
+
+impl Default for SseFrameDecoder {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+        }
+    }
+}
+
+/// Default ceiling on a single SSE frame's size. Large enough for
+/// any legitimate Anthropic / OpenAI / Gemini frame; small enough
+/// to prevent OOM from a malicious upstream.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024; // 1 MiB
 
 impl SseFrameDecoder {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            buf: Vec::new(),
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+        }
+    }
+
+    /// Override the per-frame size cap. Mostly useful in tests.
+    pub fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_frame_bytes,
+        }
     }
 
     pub fn push(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
     }
 
+    /// True if the internal buffer has grown past [`Self::max_frame_bytes`].
+    /// When true, [`Self::next_frame`] will yield a single oversize-error
+    /// frame and reset the buffer.
+    pub fn over_limit(&self) -> bool {
+        self.buf.len() > self.max_frame_bytes
+    }
+
     /// Pull one fully-received frame from the buffer if one is
     /// available. Returns `None` when the buffer does not yet contain
     /// a complete frame (a blank line separator has not arrived).
+    ///
+    /// If the buffer has grown past [`Self::max_frame_bytes`] without
+    /// a separator, the buffer is reset and a synthetic `oversize`
+    /// frame is returned. The assembler maps this to a
+    /// [`StreamEvent::ParseError`].
     pub fn next_frame(&mut self) -> Option<SseFrame> {
+        if self.over_limit() {
+            self.buf.clear();
+            return Some(SseFrame {
+                event_name: "__relix_oversize__".to_string(),
+                data: String::new(),
+            });
+        }
+
         // Frames are separated by a blank line: \n\n or \r\n\r\n.
         // Search for either pattern; pick the earliest match.
         let mut sep_at: Option<(usize, usize)> = None; // (position, length)
@@ -189,6 +240,35 @@ pub struct AnthropicStreamAssembler {
     finished: bool,
 }
 
+/// Per-block JSON-buffer cap. A malicious upstream emitting an
+/// unbounded `input_json_delta` stream is detected and the block
+/// is finalised early with `Value::Null` plus a `ParseError`.
+pub const MAX_TOOL_INPUT_BYTES: usize = 256 * 1024; // 256 KiB
+
+/// Hard cap on the length of strings copied from upstream-controlled
+/// fields (model name, tool name, error message). Anything longer is
+/// truncated when stored to keep audit logs and downstream
+/// consumers from being flooded.
+pub const MAX_LABEL_BYTES: usize = 256;
+
+fn sanitize_label(s: &str) -> String {
+    // Drop control characters that would corrupt jsonl audit logs.
+    // Keep printable ASCII and non-ASCII letter / number characters
+    // (which lets legitimate model names pass) but normalise control
+    // characters to underscore.
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.len() <= MAX_LABEL_BYTES {
+        cleaned
+    } else {
+        // Truncate at a char boundary.
+        let mut end = MAX_LABEL_BYTES;
+        while end > 0 && !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned[..end].to_string()
+    }
+}
+
 impl AnthropicStreamAssembler {
     pub fn new() -> Self {
         Self::default()
@@ -211,6 +291,14 @@ impl AnthropicStreamAssembler {
     }
 
     fn handle_frame(&mut self, frame: SseFrame) {
+        // Synthetic frame inserted by the decoder when the buffer
+        // exceeded its size cap.
+        if frame.event_name == "__relix_oversize__" {
+            self.pending_events.push(StreamEvent::ParseError {
+                reason: "sse frame exceeded size limit".into(),
+            });
+            return;
+        }
         if frame.data.is_empty() {
             return;
         }
@@ -227,11 +315,30 @@ impl AnthropicStreamAssembler {
         };
 
         let typ = raw.get("type").and_then(Value::as_str).unwrap_or("");
+
+        // A1 fix: SSE `event:` name (when present) must agree with
+        // the JSON `type` field. A poisoned upstream that sends
+        // `event: ping` but `data: {"type":"content_block_delta",...}`
+        // (or vice versa) is treated as a protocol violation.
+        // Frames without an `event:` line (the OpenAI convention)
+        // are accepted unchanged.
+        if !frame.event_name.is_empty() && frame.event_name != typ {
+            self.pending_events.push(StreamEvent::ParseError {
+                reason: format!(
+                    "sse event/type mismatch: event={} type={}",
+                    frame.event_name, typ
+                ),
+            });
+            return;
+        }
+
         match typ {
             "message_start" => {
                 if let Some(model) = raw.pointer("/message/model").and_then(Value::as_str) {
+                    // C1 fix: sanitize upstream-controlled string before
+                    // emitting it into events that may reach audit logs.
                     self.pending_events.push(StreamEvent::StreamStart {
-                        model: model.to_string(),
+                        model: sanitize_label(model),
                     });
                 }
             }
@@ -241,22 +348,31 @@ impl AnthropicStreamAssembler {
                     Some(v) => v,
                     None => return,
                 };
+
+                // A3 fix: a duplicate content_block_start for the same
+                // index is a protocol violation. We surface it as a
+                // ParseError and overwrite (the second one wins,
+                // because that matches the most-paranoid-inspector
+                // posture: if we are going to evaluate something,
+                // evaluate the latest claimed content). Without this
+                // detection an attacker could finalise a benign
+                // tool_use first, pass rules, then sneak a second
+                // payload through.
+                if self.blocks.contains_key(&index) {
+                    self.pending_events.push(StreamEvent::ParseError {
+                        reason: format!("duplicate content_block_start at index {index}"),
+                    });
+                }
+
                 let block_type = cb.get("type").and_then(Value::as_str).unwrap_or("");
                 match block_type {
                     "text" => {
                         self.blocks.insert(index, BlockState::Text);
                     }
                     "tool_use" | "server_tool_use" => {
-                        let id = cb
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let name = cb
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
+                        let id = sanitize_label(cb.get("id").and_then(Value::as_str).unwrap_or(""));
+                        let name =
+                            sanitize_label(cb.get("name").and_then(Value::as_str).unwrap_or(""));
                         self.blocks.insert(
                             index,
                             BlockState::ToolUse {
@@ -285,8 +401,35 @@ impl AnthropicStreamAssembler {
                     Some(s) => s,
                     None => return,
                 };
-                if let Some(BlockState::ToolUse { json_buf, .. }) = self.blocks.get_mut(&index) {
-                    json_buf.push_str(partial);
+                // A4 fix: cap json_buf growth. If the cap is exceeded
+                // we record a ParseError and finalise the block early
+                // with `Value::Null` so a downstream rule that wants to
+                // refuse on unknown input can do so. The block is
+                // removed so subsequent deltas have no effect.
+                let mut overflow_index: Option<(u32, String, String)> = None;
+                if let Some(BlockState::ToolUse {
+                    json_buf, id, name, ..
+                }) = self.blocks.get_mut(&index)
+                {
+                    if json_buf.len().saturating_add(partial.len()) > MAX_TOOL_INPUT_BYTES {
+                        overflow_index = Some((index, id.clone(), name.clone()));
+                    } else {
+                        json_buf.push_str(partial);
+                    }
+                }
+                if let Some((idx, id, name)) = overflow_index {
+                    self.blocks.remove(&idx);
+                    self.pending_events.push(StreamEvent::ParseError {
+                        reason: format!(
+                            "tool_use input exceeded {MAX_TOOL_INPUT_BYTES}-byte cap at index {idx}"
+                        ),
+                    });
+                    self.pending_events.push(StreamEvent::ToolUseFinalised {
+                        index: idx,
+                        id,
+                        name,
+                        input: Value::Null,
+                    });
                 }
             }
             "content_block_stop" => {
@@ -325,12 +468,38 @@ impl AnthropicStreamAssembler {
                 if let Some(stop_reason) = raw.pointer("/delta/stop_reason").and_then(Value::as_str)
                 {
                     self.pending_events.push(StreamEvent::StreamEnd {
-                        stop_reason: Some(stop_reason.to_string()),
+                        stop_reason: Some(sanitize_label(stop_reason)),
                     });
                 }
             }
             "message_stop" => {
                 self.finished = true;
+                // A3 follow-on: if blocks remain unclosed at message_stop,
+                // force-finalise tool_use blocks with the current buffer.
+                // This prevents "open block forever" stalling inspection.
+                let leftovers: Vec<u32> = self.blocks.keys().copied().collect();
+                for idx in leftovers {
+                    if let Some(BlockState::ToolUse { id, name, json_buf }) =
+                        self.blocks.remove(&idx)
+                    {
+                        let input = if json_buf.trim().is_empty() {
+                            Value::Null
+                        } else {
+                            serde_json::from_str(&json_buf).unwrap_or(Value::Null)
+                        };
+                        self.pending_events.push(StreamEvent::ParseError {
+                            reason: format!(
+                                "tool_use at index {idx} closed without content_block_stop"
+                            ),
+                        });
+                        self.pending_events.push(StreamEvent::ToolUseFinalised {
+                            index: idx,
+                            id,
+                            name,
+                            input,
+                        });
+                    }
+                }
                 // If we never saw a message_delta with stop_reason,
                 // emit an end event with None.
                 if !self
@@ -372,6 +541,15 @@ mod tests {
 
     fn frame(event: &str, data: &str) -> Vec<u8> {
         format!("event: {event}\ndata: {data}\n\n").into_bytes()
+    }
+
+    /// SSE frame helper that produces a `data:`-only frame (no
+    /// `event:` line). Used to bypass the strict event-vs-type
+    /// agreement check in tests where the event name was a free
+    /// label in v0.2-step2 (e.g. "a", "b") rather than an actual
+    /// Anthropic event type.
+    fn data_only(data: &str) -> Vec<u8> {
+        format!("data: {data}\n\n").into_bytes()
     }
 
     #[test]
@@ -565,5 +743,152 @@ mod tests {
             .drain_events()
             .iter()
             .all(|e| !matches!(e, StreamEvent::ToolUseFinalised { .. })));
+    }
+
+    // -- red-team regressions ----------------------------------------------
+
+    #[test]
+    fn rt_a1_event_name_must_match_data_type() {
+        // Frame whose `event:` line contradicts its `data.type` field.
+        // A poisoned upstream might use this to slip events past
+        // type-aware inspection.
+        let mut a = AnthropicStreamAssembler::new();
+        let bytes = b"event: ping\n\
+                      data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"x\"}}\n\
+                      \n";
+        a.push_bytes(bytes);
+        let events = a.drain_events();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ParseError { reason } if reason.contains("event/type mismatch")
+            )),
+            "expected event/type mismatch parse error, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn rt_a3_duplicate_content_block_start_is_flagged() {
+        let mut a = AnthropicStreamAssembler::new();
+        a.push_bytes(&frame(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}"#,
+        ));
+        a.push_bytes(&frame(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t2","name":"Bash","input":{}}}"#,
+        ));
+        let events = a.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ParseError { reason } if reason.contains("duplicate content_block_start")
+        )));
+    }
+
+    #[test]
+    fn rt_a3_unclosed_block_finalised_at_message_stop() {
+        // tool_use opened but never explicitly stopped should still be
+        // evaluated when the stream ends. Otherwise an attacker can
+        // park malicious payloads inside an open block.
+        let mut a = AnthropicStreamAssembler::new();
+        a.push_bytes(&frame(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":7,"content_block":{"type":"tool_use","id":"t1","name":"Bash","input":{}}}"#,
+        ));
+        a.push_bytes(&frame(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":7,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}"#,
+        ));
+        a.push_bytes(&frame("message_stop", r#"{"type":"message_stop"}"#));
+        let events = a.drain_events();
+        // Expect both a ParseError (unclosed) and a ToolUseFinalised.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ParseError { reason } if reason.contains("closed without")
+        )));
+        let finalised = events.iter().find_map(|e| match e {
+            StreamEvent::ToolUseFinalised { name, input, .. } => {
+                Some((name.clone(), input.clone()))
+            }
+            _ => None,
+        });
+        let (name, input) = finalised.expect("force-finalised tool_use");
+        assert_eq!(name, "Bash");
+        assert_eq!(input.get("command").and_then(Value::as_str), Some("ls"));
+    }
+
+    #[test]
+    fn rt_a4_tool_input_size_cap() {
+        // A delta sequence whose cumulative size exceeds the cap is
+        // truncated and the block is finalised early with Null input.
+        let mut a = AnthropicStreamAssembler::new();
+        a.push_bytes(&frame(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"X","input":{}}}"#,
+        ));
+        // One delta carrying just over the cap.
+        let oversize = "x".repeat(MAX_TOOL_INPUT_BYTES + 16);
+        let payload = format!(
+            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":"{oversize}"}}}}"#
+        );
+        a.push_bytes(&frame("content_block_delta", &payload));
+        let events = a.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ParseError { reason } if reason.contains("exceeded")
+        )));
+        let null_input = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::ToolUseFinalised { input, .. } if matches!(input, Value::Null)
+            )
+        });
+        assert!(null_input);
+    }
+
+    #[test]
+    fn rt_c1_model_field_control_chars_stripped() {
+        // Upstream tries to inject newlines / control characters via
+        // the model field, hoping to corrupt jsonl audit logs.
+        let mut a = AnthropicStreamAssembler::new();
+        a.push_bytes(&frame(
+            "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"evil\\u0000\\u0007\\nclaude\",\"role\":\"assistant\"}}",
+        ));
+        let events = a.drain_events();
+        let model = events.iter().find_map(|e| match e {
+            StreamEvent::StreamStart { model } => Some(model.clone()),
+            _ => None,
+        });
+        let m = model.expect("StreamStart emitted");
+        assert!(!m.contains('\n'), "newline survived sanitization: {m:?}");
+        assert!(!m.contains('\u{0000}'), "null survived sanitization");
+        assert!(!m.contains('\u{0007}'), "bell survived sanitization");
+    }
+
+    #[test]
+    fn rt_decoder_oversize_buffer_yields_synthetic_error_frame() {
+        // Bytes that never include a frame separator should be
+        // dropped once they exceed the cap, with the assembler
+        // surfacing a ParseError.
+        let mut a = AnthropicStreamAssembler::default();
+        // Use the public assembler so the synthetic frame routes
+        // through handle_frame.
+        a.assembler_mut_max_for_test(64);
+        a.push_bytes(&vec![b'x'; 256]);
+        let events = a.drain_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ParseError { reason } if reason.contains("size limit")
+        )));
+    }
+}
+
+// Test-only helper: shrink the decoder cap so the oversize path is
+// exercised without allocating megabytes in tests.
+#[cfg(test)]
+impl AnthropicStreamAssembler {
+    fn assembler_mut_max_for_test(&mut self, cap: usize) {
+        self.decoder = SseFrameDecoder::with_max_frame_bytes(cap);
     }
 }
