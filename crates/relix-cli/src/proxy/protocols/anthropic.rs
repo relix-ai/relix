@@ -62,7 +62,7 @@ impl LlmProxy for AnthropicProtocol {
             system_prompt: system_prompt.as_deref(),
         };
         let verdict = relix_core::inspect::evaluate(&state.rules, &inspection_ctx);
-        state.audit.record(&event, &verdict).await;
+        state.audit.record(&event, &verdict);
 
         if let Decision::Block { reason, rule_id } = &verdict.decision {
             info!(rule = %rule_id, "blocking outbound request");
@@ -96,7 +96,7 @@ impl LlmProxy for AnthropicProtocol {
             system_prompt: None,
         };
         let verdict = relix_core::inspect::evaluate(&state.rules, &inspection_ctx);
-        state.audit.record(&event, &verdict).await;
+        state.audit.record(&event, &verdict);
 
         if matches!(verdict.decision, Decision::Block { .. }) {
             if let Decision::Block { rule_id, .. } = &verdict.decision {
@@ -179,14 +179,10 @@ impl StreamingProtocolState for AnthropicStreamingState {
                     };
                     let verdict = relix_core::inspect::evaluate(&state.rules, &inspection_ctx);
 
-                    // Audit record is fire-and-forget; we do not block
-                    // the streaming path on the disk write.
-                    let audit = state.audit.clone();
-                    let event_clone = event.clone();
-                    let verdict_clone = verdict.clone();
-                    tokio::spawn(async move {
-                        audit.record(&event_clone, &verdict_clone).await;
-                    });
+                    // Non-blocking enqueue. The single writer task
+                    // serialises records and owns the file handle;
+                    // see audit::AuditLog (RFC-0003 H2).
+                    state.audit.record(&event, &verdict);
 
                     if matches!(verdict.decision, Decision::Block { .. }) {
                         if let Decision::Block { rule_id, .. } = &verdict.decision {
