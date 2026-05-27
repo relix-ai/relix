@@ -15,9 +15,11 @@ pub mod model;
 pub mod protocol;
 pub mod rules;
 pub mod streaming;
+pub mod streaming_openai;
 
 pub use error::{Error, Result};
 pub use inspect::{Decision, InspectionContext, Verdict};
 pub use model::{HttpDirection, InspectionEvent, ToolCall};
 pub use rules::{Rule, RuleAction, RuleSet, Severity};
 pub use streaming::{AnthropicStreamAssembler, SseFrame, SseFrameDecoder, StreamEvent};
+pub use streaming_openai::OpenAiStreamAssembler;

@@ -251,7 +251,7 @@ pub const MAX_TOOL_INPUT_BYTES: usize = 256 * 1024; // 256 KiB
 /// consumers from being flooded.
 pub const MAX_LABEL_BYTES: usize = 256;
 
-fn sanitize_label(s: &str) -> String {
+pub(crate) fn sanitize_label(s: &str) -> String {
     // Drop control characters that would corrupt jsonl audit logs.
     // Keep printable ASCII and non-ASCII letter / number characters
     // (which lets legitimate model names pass) but normalise control
