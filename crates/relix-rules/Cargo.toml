@@ -1,0 +1,18 @@
+[package]
+name = "relix-rules"
+description = "Rule loading, validation, and subscription for Relix."
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+relix-core = { path = "../relix-core" }
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

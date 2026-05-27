@@ -1,0 +1,22 @@
+# Known-bad upstream relay infrastructure.
+#
+# Domains in this file have been observed redirecting, modifying, or
+# injecting content into LLM API traffic. We block them at the proxy
+# level so users get an immediate signal if their ANTHROPIC_BASE_URL or
+# OPENAI_BASE_URL points at one.
+#
+# Contributions: open a PR with evidence (request capture / response diff
+# / disclosure post). Domains are added with reviewer GPG signatures.
+
+rules:
+  - id: relix.upstream.example-bad
+    name: known-bad relay (example placeholder)
+    description: |
+      Placeholder rule shipped with the bundle. Replace with real entries
+      contributed via the relix-rules repository.
+    severity: critical
+    action: block
+    tags: [upstream, placeholder]
+    matcher:
+      kind: upstream_host
+      domain: relay.example-bad.test

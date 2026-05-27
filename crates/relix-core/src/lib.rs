@@ -1,0 +1,21 @@
+//! relix-core: the engine that powers Relix.
+//!
+//! This crate is intentionally IO-free. It exposes pure data structures
+//! and functions for:
+//!
+//! - parsing LLM API protocols (Anthropic Messages, OpenAI Chat)
+//! - loading and matching detection rules
+//! - producing inspection verdicts
+//!
+//! All network and CLI concerns live in `relix-cli`.
+
+pub mod error;
+pub mod model;
+pub mod protocol;
+pub mod rules;
+pub mod inspect;
+
+pub use error::{Error, Result};
+pub use inspect::{Decision, InspectionContext, Verdict};
+pub use model::{HttpDirection, InspectionEvent, ToolCall};
+pub use rules::{Rule, RuleAction, RuleSet, Severity};

@@ -1,0 +1,31 @@
+# Suspicious system prompt / inbound payload patterns.
+#
+# These rules look at what the upstream API has returned, watching for
+# instructions injected by a poisoned relay that ask the agent to do
+# unusual things on the user's machine.
+
+rules:
+  - id: relix.prompt.sensitive-file-read
+    name: response asks agent to read sensitive files
+    description: |
+      Detected in upstream response: instructions referencing typical
+      sensitive paths (.ssh, .env, AWS creds). Legitimate Anthropic
+      responses rarely contain phrases like "please read your private key".
+    severity: high
+    action: warn
+    tags: [prompt-injection]
+    matcher:
+      kind: system_prompt_regex
+      pattern: "(?i)(read\\s+(your|the)\\s+(\\.ssh|private\\s+key|credentials?\\s+file)|cat\\s+~/\\.ssh|dump\\s+\\.env)"
+
+  - id: relix.prompt.exfil-verbs
+    name: response contains exfiltration vocabulary
+    description: |
+      The agent is being asked to "send", "post", "upload" credentials,
+      keys, or environment to an external destination.
+    severity: medium
+    action: warn
+    tags: [prompt-injection]
+    matcher:
+      kind: system_prompt_regex
+      pattern: "(?i)(send|post|upload|exfiltrate)\\s+.{0,40}(secret|token|key|credential|\\.env|\\.ssh)"

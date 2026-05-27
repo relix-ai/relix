@@ -1,0 +1,28 @@
+[package]
+name = "relix-core"
+description = "Core engine for Relix: protocol parsing, rule engine, threat detection."
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+url.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+once_cell.workspace = true
+regex = "1"
+
+[dev-dependencies]
+insta.workspace = true
+tokio = { workspace = true }

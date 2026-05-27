@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Local audit logs
+*.jsonl
+.relix/
+
+# Local secrets (never commit anything matching)
+*.env
+.env.*
+*.pem
+*.key

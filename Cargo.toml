@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/relix-core",
+    "crates/relix-cli",
+    "crates/relix-rules",
+    "examples/poisoned-relay",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Relix Contributors"]
+repository = "https://github.com/relix-ai/relix"
+homepage = "https://relix.dev"
+rust-version = "1.78"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# HTTP server / client
+axum = { version = "0.7", features = ["macros"] }
+hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Utilities
+bytes = "1"
+url = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+once_cell = "1"
+
+# Stream parsing
+eventsource-stream = "0.2"
+
+# Testing
+wiremock = "0.6"
+insta = { version = "1", features = ["yaml", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

