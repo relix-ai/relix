@@ -196,8 +196,16 @@ impl fmt::Display for Placeholder {
 /// Strict placeholder regex. Captures must agree with the
 /// `render()` output exactly: angle brackets, fixed attribute
 /// names, exact spacing, double-quoted values.
+///
+/// We allow each `"` to be optionally preceded by a single `\`
+/// because real-world responses embed the placeholder inside
+/// JSON string values where the model (or the upstream
+/// serialiser) escapes the inner quotes. Without this, a
+/// model that quotes our placeholder back inside a `"echo"`
+/// field would never get restored.
 static PLACEHOLDER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"<RELIX_SECRET kind="(?P<kind>[a-z_]+)" id="(?P<id>[0-9a-f]+)">"#).unwrap()
+    Regex::new(r#"<RELIX_SECRET kind=\\?"(?P<kind>[a-z_]+)\\?" id=\\?"(?P<id>[0-9a-f]+)\\?">"#)
+        .unwrap()
 });
 
 #[cfg(test)]
