@@ -25,8 +25,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
 use crate::proxy::lifecycle::{
-    BodyFilterAction, HookOutcome, ProxyContext, ResponseAction, StreamingState, blocked_response,
-    streaming_block_frame,
+    blocked_response, streaming_block_frame, BodyFilterAction, HookOutcome, ProxyContext,
+    ResponseAction, StreamingState,
 };
 use crate::proxy::protocols;
 use crate::proxy::state::ProxyState;
@@ -38,12 +38,21 @@ use crate::proxy::state::ProxyState;
 /// exhaust memory by streaming a never-ending request body.
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Per-chunk slice cap fed to the streaming inspector and to the
+/// downstream channel (RFC-0003 H9). `reqwest::Response::bytes_stream`
+/// may yield arbitrary-sized chunks; a malicious upstream that pushes
+/// a single multi-megabyte chunk would force the SSE decoder to
+/// allocate the full chunk before the per-frame 1 MiB cap fires,
+/// since the cap is checked once per `next_frame` call. Slicing on
+/// the way in keeps the assembler buffer growth bounded by this cap
+/// per iteration and also reduces inspection latency on legitimate
+/// fragmented streams. 64 KiB matches typical TLS record / TCP
+/// segment sizes so well-behaved upstreams pay no extra copy cost.
+const MAX_CHUNK_SLICE: usize = 64 * 1024;
+
 /// Top-level axum handler. Wraps [`drive`] and converts internal
 /// errors into a structured 502.
-pub async fn proxy_handler(
-    State(state): State<ProxyState>,
-    req: Request<Body>,
-) -> Response {
+pub async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> Response {
     match drive(state, req).await {
         Ok(resp) => resp,
         Err(err) => {
@@ -93,10 +102,8 @@ async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response
         .map(str::to_string)
         .unwrap_or_else(|| "unknown".into());
 
-    let upstream_url =
-        crate::proxy::url::build_upstream_url(&upstream_base, &parts.uri).map_err(|e| {
-            anyhow::anyhow!("upstream URL construction rejected inbound URI: {e}")
-        })?;
+    let upstream_url = crate::proxy::url::build_upstream_url(&upstream_base, &parts.uri)
+        .map_err(|e| anyhow::anyhow!("upstream URL construction rejected inbound URI: {e}"))?;
 
     let mut ctx = ProxyContext::new(parts.method.clone(), parts.uri.clone(), upstream_host);
     let protocol = protocols::select(&parts.uri);
@@ -258,42 +265,52 @@ where
                 Ok(b) => b,
                 Err(err) => {
                     warn!(error = %err, "upstream stream error");
-                    let _ = tx
-                        .send(Err(std::io::Error::other(err.to_string())))
-                        .await;
+                    let _ = tx.send(Err(std::io::Error::other(err.to_string()))).await;
                     return;
                 }
             };
 
-            // Inspect under lock. The lock is per-request, so this
-            // does not contend with anything else.
-            let action = {
-                let mut guard = stream_state.lock().await;
-                match guard.feed_chunk(&state, &ctx, &chunk) {
-                    Ok(a) => a,
-                    Err(err) => {
-                        warn!(error = %err, "stream inspector error (forwarding anyway)");
-                        BodyFilterAction::Forward
+            // RFC-0003 H9: slice the upstream chunk into <= 64 KiB
+            // pieces before inspection. Without this, a single
+            // chunk of N MiB pushes N MiB into the assembler buffer
+            // before the 1 MiB per-frame cap can fire, since the
+            // cap is checked once per `next_frame` call rather than
+            // on each push. Slicing also bounds the size of each
+            // forwarded `Bytes` we hand to the downstream channel.
+            for slice in slice_chunk(chunk, MAX_CHUNK_SLICE) {
+                // Inspect under lock. The lock is per-request, so
+                // this does not contend with anything else.
+                let action = {
+                    let mut guard = stream_state.lock().await;
+                    match guard.feed_chunk(&state, &ctx, &slice) {
+                        Ok(a) => a,
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                "stream inspector error (forwarding anyway)"
+                            );
+                            BodyFilterAction::Forward
+                        }
                     }
-                }
-            };
+                };
 
-            match action {
-                BodyFilterAction::Forward => {
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        // Downstream went away. Stop forwarding.
+                match action {
+                    BodyFilterAction::Forward => {
+                        if tx.send(Ok(slice)).await.is_err() {
+                            // Downstream went away. Stop forwarding.
+                            return;
+                        }
+                    }
+                    BodyFilterAction::BlockMidStream(verdict) => {
+                        let (rule_id, reason) = match verdict.decision {
+                            relix_core::Decision::Block { rule_id, reason } => (rule_id, reason),
+                            _ => ("relix.unknown".to_string(), "blocked".to_string()),
+                        };
+                        let frame = streaming_block_frame(&rule_id, &reason);
+                        let _ = tx.send(Ok(frame)).await;
+                        // Drop the upstream stream; reqwest will close.
                         return;
                     }
-                }
-                BodyFilterAction::BlockMidStream(verdict) => {
-                    let (rule_id, reason) = match verdict.decision {
-                        relix_core::Decision::Block { rule_id, reason } => (rule_id, reason),
-                        _ => ("relix.unknown".to_string(), "blocked".to_string()),
-                    };
-                    let frame = streaming_block_frame(&rule_id, &reason);
-                    let _ = tx.send(Ok(frame)).await;
-                    // Drop the upstream stream; reqwest will close.
-                    return;
                 }
             }
         }
@@ -322,4 +339,96 @@ fn is_hop_by_hop(name: &str) -> bool {
         lname.as_str(),
         "content-length" | "transfer-encoding" | "connection"
     )
+}
+
+/// Slice a chunk into pieces of at most `max` bytes (RFC-0003 H9).
+///
+/// Returns an iterator of cheap `Bytes::slice` views (no copy) so the
+/// caller can feed each piece independently to the inspector and the
+/// downstream channel. Always yields at least one piece, even for an
+/// empty input chunk, to preserve original framing for empty
+/// keep-alive chunks (rare but legal in chunked-transfer).
+fn slice_chunk(chunk: Bytes, max: usize) -> impl Iterator<Item = Bytes> {
+    debug_assert!(max > 0, "slice cap must be positive");
+    let total = chunk.len();
+    let mut offset = 0usize;
+    let mut yielded_empty = false;
+
+    std::iter::from_fn(move || {
+        if total == 0 {
+            if yielded_empty {
+                return None;
+            }
+            yielded_empty = true;
+            return Some(chunk.clone());
+        }
+        if offset >= total {
+            return None;
+        }
+        let end = offset.saturating_add(max).min(total);
+        let piece = chunk.slice(offset..end);
+        offset = end;
+        Some(piece)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_chunk_yields_pieces_of_at_most_max() {
+        let chunk = Bytes::from(vec![0u8; 200_000]);
+        let pieces: Vec<Bytes> = slice_chunk(chunk, MAX_CHUNK_SLICE).collect();
+        // 200_000 / 65_536 = 3 full + 1 partial (3408 bytes).
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(pieces[0].len(), MAX_CHUNK_SLICE);
+        assert_eq!(pieces[1].len(), MAX_CHUNK_SLICE);
+        assert_eq!(pieces[2].len(), MAX_CHUNK_SLICE);
+        assert_eq!(pieces[3].len(), 200_000 - 3 * MAX_CHUNK_SLICE);
+        let total: usize = pieces.iter().map(|p| p.len()).sum();
+        assert_eq!(total, 200_000);
+    }
+
+    #[test]
+    fn slice_chunk_passes_small_chunk_through_unchanged() {
+        let chunk = Bytes::from_static(b"hello");
+        let pieces: Vec<Bytes> = slice_chunk(chunk.clone(), MAX_CHUNK_SLICE).collect();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], chunk);
+    }
+
+    #[test]
+    fn slice_chunk_handles_exact_multiple() {
+        let size = MAX_CHUNK_SLICE * 3;
+        let chunk = Bytes::from(vec![1u8; size]);
+        let pieces: Vec<Bytes> = slice_chunk(chunk, MAX_CHUNK_SLICE).collect();
+        assert_eq!(pieces.len(), 3);
+        for p in &pieces {
+            assert_eq!(p.len(), MAX_CHUNK_SLICE);
+        }
+    }
+
+    #[test]
+    fn slice_chunk_handles_empty_chunk() {
+        let chunk = Bytes::new();
+        let pieces: Vec<Bytes> = slice_chunk(chunk, MAX_CHUNK_SLICE).collect();
+        // Empty input still yields one (empty) piece so framing is
+        // preserved on keep-alive style chunks.
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].len(), 0);
+    }
+
+    #[test]
+    fn slice_chunk_caps_a_one_megabyte_chunk() {
+        // RFC-0003 H9 motivating case: a 1 MiB single chunk must be
+        // split into many pieces, none exceeding the cap.
+        let size = 1024 * 1024;
+        let chunk = Bytes::from(vec![0xAB; size]);
+        let pieces: Vec<Bytes> = slice_chunk(chunk, MAX_CHUNK_SLICE).collect();
+        assert_eq!(pieces.len(), size / MAX_CHUNK_SLICE);
+        for p in &pieces {
+            assert!(p.len() <= MAX_CHUNK_SLICE);
+        }
+    }
 }
