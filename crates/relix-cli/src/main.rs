@@ -53,9 +53,7 @@ async fn start(
 
     let audit = AuditLog::open(expand_tilde(&audit_path)).await?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    let client = crate::proxy::client::build()?;
 
     let state = ProxyState {
         upstream,
