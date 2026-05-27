@@ -104,6 +104,12 @@ pub fn classify_path(raw_path: &str) -> PathDecision {
 ///
 /// - `..` segments (path traversal),
 /// - encoded forward slash `%2F` / `%2f` (smuggling),
+/// - encoded dot `%2E` / `%2e` (path-traversal via double encoding;
+///   one half of `%2e%2e` was previously not caught by the literal
+///   `..` check),
+/// - encoded backslash `%5C` / `%5c` (Windows path-equivalent
+///   separator on upstreams that normalise to native paths),
+/// - encoded NUL `%00`,
 /// - any ASCII control character including NUL, CR, LF, TAB,
 /// - any byte > 0x7E (non-printable ASCII; legitimate paths use
 ///   percent-encoding instead).
@@ -112,6 +118,12 @@ pub fn is_path_safe(raw_path: &str) -> bool {
         return false;
     }
     if raw_path.contains("%2F") || raw_path.contains("%2f") {
+        return false;
+    }
+    if raw_path.contains("%2E") || raw_path.contains("%2e") {
+        return false;
+    }
+    if raw_path.contains("%5C") || raw_path.contains("%5c") {
         return false;
     }
     if raw_path.contains("%00") {
@@ -174,6 +186,25 @@ mod tests {
     fn path_safety_rejects_encoded_slash() {
         assert!(!is_path_safe("/v1%2Fmessages"));
         assert!(!is_path_safe("/v1%2fmessages"));
+    }
+
+    #[test]
+    fn rt_path_safety_rejects_encoded_dots() {
+        // Red-team regression: `%2e%2e` decodes to `..`. Without the
+        // `%2e` reject the literal `..` check is bypassed because the
+        // raw path string only contains `%2e%2e`, never `..`.
+        assert!(!is_path_safe("/v1/%2e%2e/etc/passwd"));
+        assert!(!is_path_safe("/v1/%2E%2E/etc/passwd"));
+        // Mixed case attackers also try.
+        assert!(!is_path_safe("/v1/%2e./etc/passwd"));
+    }
+
+    #[test]
+    fn rt_path_safety_rejects_encoded_backslash() {
+        // Windows / WSL upstreams may normalise %5C ('\\') to a path
+        // separator. Treat it the same as %2F.
+        assert!(!is_path_safe("/v1%5Cmessages"));
+        assert!(!is_path_safe("/v1%5cmessages"));
     }
 
     #[test]

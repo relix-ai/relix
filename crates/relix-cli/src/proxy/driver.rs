@@ -50,6 +50,18 @@ const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// segment sizes so well-behaved upstreams pay no extra copy cost.
 const MAX_CHUNK_SLICE: usize = 64 * 1024;
 
+/// Hard cap on the total size of a buffered (non-streaming) upstream
+/// response (RFC-0003 H9 red-team follow-up). The streaming branch
+/// is bounded by [`MAX_CHUNK_SLICE`] per inspection step plus the
+/// 1 MiB per-frame cap inside the SSE decoder; the buffered branch,
+/// in contrast, calls `Response::bytes()` which collects the entire
+/// body into memory before inspection. Without this cap a malicious
+/// upstream could force Relix to allocate gigabytes by chunking a
+/// huge JSON message. 32 MiB is well above any legitimate Anthropic
+/// or OpenAI non-streaming response (token-count, models list,
+/// completed message) and well below process memory pressure.
+const MAX_BUFFERED_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Top-level axum handler. Wraps [`drive`] and converts internal
 /// errors into a structured 502.
 pub async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> Response {
@@ -167,7 +179,7 @@ async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response
     }
 
     // Stage 3b: buffered branch
-    let resp_bytes = upstream_resp.bytes().await?;
+    let resp_bytes = collect_capped(upstream_resp.bytes_stream()).await?;
     let action = protocol
         .response_filter(&mut ctx, &state, status, &resp_headers_orig, &resp_bytes)
         .await?;
@@ -341,6 +353,35 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+/// Collect a buffered upstream response into a single `Bytes`, bailing
+/// with a hard error once [`MAX_BUFFERED_RESPONSE_BYTES`] is exceeded
+/// (RFC-0003 H9 red-team follow-up).
+///
+/// Using this in place of `Response::bytes()` means a malicious
+/// upstream cannot drive Relix to OOM by chunked-encoding a giant
+/// non-streaming response. The cap is checked on each chunk so the
+/// allocation never grows past it.
+async fn collect_capped<S>(stream: S) -> anyhow::Result<Bytes>
+where
+    S: futures::Stream<Item = reqwest::Result<Bytes>> + Send + 'static + Unpin,
+{
+    let mut stream = stream;
+    let mut total: u64 = 0;
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > MAX_BUFFERED_RESPONSE_BYTES {
+            anyhow::bail!(
+                "upstream response exceeds {} byte cap",
+                MAX_BUFFERED_RESPONSE_BYTES
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
 /// Slice a chunk into pieces of at most `max` bytes (RFC-0003 H9).
 ///
 /// Returns an iterator of cheap `Bytes::slice` views (no copy) so the
@@ -430,5 +471,30 @@ mod tests {
         for p in &pieces {
             assert!(p.len() <= MAX_CHUNK_SLICE);
         }
+    }
+
+    #[tokio::test]
+    async fn rt_collect_capped_rejects_oversize_buffered_response() {
+        // Red-team regression for the H9 follow-up: a malicious
+        // non-streaming upstream that exceeds the buffered cap must
+        // be rejected before the body is fully buffered.
+        let one_mb_chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let chunks = (0..40)
+            .map(|_| Ok::<_, reqwest::Error>(one_mb_chunk.clone()))
+            .collect::<Vec<_>>();
+        let stream = futures::stream::iter(chunks);
+        let err = collect_capped(stream).await.expect_err("must reject");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected size cap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_capped_passes_legitimate_response() {
+        let body = Bytes::from_static(b"{\"ok\":true}");
+        let stream = futures::stream::iter(vec![Ok::<_, reqwest::Error>(body.clone())]);
+        let collected = collect_capped(stream).await.expect("collect");
+        assert_eq!(collected, body);
     }
 }
