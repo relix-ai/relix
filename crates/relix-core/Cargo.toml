@@ -22,6 +22,10 @@ chrono.workspace = true
 uuid.workspace = true
 once_cell.workspace = true
 regex = "1"
+blake3 = "1"
+secrecy = { version = "0.8", features = ["serde"] }
+zeroize = "1"
+tokio = { workspace = true, default-features = false, features = ["sync", "time"] }
 
 [dev-dependencies]
 insta.workspace = true
