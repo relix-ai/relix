@@ -251,6 +251,44 @@ protocol work. step4 picks up the rest. v0.3 ships as a coherent
 package: streaming inspection across three protocols + the full
 hardening matrix + the rule subscription feed.
 
+## Red-team review (post-step3 self-audit)
+
+After landing H1/H4/H9/H6/H2 the residual gaps below were caught
+and triaged. Items R1-R2 were fixed in-line as part of step3; R3
+defers to step4 alongside the remaining H3/H5/H7/H8 work.
+
+### R1 — Encoded path-traversal bypass (fixed)
+
+`is_path_safe` rejected the literal `..` but a request whose raw
+path was `/v1/%2e%2e/etc/passwd` would slip past: the byte
+sequence `..` only appears after percent-decoding, which an
+upstream may perform. Likewise `%5c` decodes to `\`, which
+upstreams normalising to native paths treat as a separator.
+Reject extended to `%2E`/`%2e`/`%5C`/`%5c`.
+
+### R2 — Buffered upstream response had no size cap (fixed)
+
+H9 capped the streaming branch but Stage 3b still called
+`Response::bytes()` with no upper bound; a chunked-encoded
+multi-gigabyte non-streaming response would OOM the proxy.
+Replaced with `collect_capped` that walks `bytes_stream` and
+bails at 32 MiB.
+
+### R3 — Audit writer JSONL durability and graceful shutdown (deferred)
+
+The single-writer task uses two `write_all` calls (line, then
+`\n`). A crash between them produces a partial JSONL line that
+breaks downstream parsers. Additionally the writer is spawned as
+a fire-and-forget task with no `JoinHandle` retained: on process
+exit, in-flight bytes depend on tokio's drop ordering rather than
+an explicit drain.
+
+Resolution (step4): combine line+newline into a single
+`write_all` and add a graceful shutdown path that signals the
+writer, awaits its `JoinHandle`, then exits.
+
+**File.** `crates/relix-cli/src/audit.rs`.
+
 ## Non-goals
 
 This RFC does not:
