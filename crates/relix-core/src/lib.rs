@@ -10,12 +10,14 @@
 //! All network and CLI concerns live in `relix-cli`.
 
 pub mod error;
+pub mod inspect;
 pub mod model;
 pub mod protocol;
 pub mod rules;
-pub mod inspect;
+pub mod streaming;
 
 pub use error::{Error, Result};
 pub use inspect::{Decision, InspectionContext, Verdict};
 pub use model::{HttpDirection, InspectionEvent, ToolCall};
 pub use rules::{Rule, RuleAction, RuleSet, Severity};
+pub use streaming::{AnthropicStreamAssembler, SseFrame, SseFrameDecoder, StreamEvent};

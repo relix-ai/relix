@@ -9,25 +9,26 @@
 //! [`crate::proxy::driver`] module dispatches incoming requests to
 //! the right implementation based on URL path.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::http::{HeaderMap, Method, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use bytes::Bytes;
 use relix_core::Verdict;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::proxy::state::ProxyState;
 
 /// Per-request inspection context. Lives for the duration of a single
-/// HTTP request through the proxy. Hooks may store extra state in
-/// the implementation's own struct fields if needed.
+/// HTTP request through the proxy.
 ///
-/// `method` and `uri` are kept on the context so future hooks
-/// (notably `response_body_filter` for streaming responses, planned
-/// for v0.2-step2) can introspect the original request without
-/// holding a reference to the now-consumed `Request`. They appear
-/// unused in v0.2-step1 because no hook reads them yet.
+/// `method` and `uri` are retained on the context so streaming hooks
+/// (notably [`LlmProxy::response_body_filter`]) can introspect the
+/// original request without holding a reference to the consumed
+/// axum `Request`.
 #[allow(dead_code)]
 pub struct ProxyContext {
     pub session_id: Uuid,
@@ -48,8 +49,8 @@ impl ProxyContext {
 }
 
 /// Outcome of an early lifecycle hook. Mirrors Pingora's pattern:
-/// a hook may either let the pipeline continue, short-circuit with
-/// a synthesized response, or fail the request entirely.
+/// a hook may either let the pipeline continue, or short-circuit
+/// with a synthesized response.
 pub enum HookOutcome {
     /// Continue to the next stage of the pipeline.
     Continue,
@@ -59,11 +60,64 @@ pub enum HookOutcome {
     ShortCircuit(Response),
 }
 
+/// Outcome of [`LlmProxy::response_filter`] (buffered path).
+pub enum ResponseAction {
+    /// Forward the upstream response to the agent unchanged.
+    Forward,
+    /// Replace the response with a block notice carrying the verdict.
+    Block(Verdict),
+}
+
+/// Outcome of [`LlmProxy::response_body_filter`] (streaming path),
+/// applied per chunk.
+pub enum BodyFilterAction {
+    /// Forward this chunk to the agent unchanged.
+    Forward,
+    /// A rule fired during streaming. The driver will close the
+    /// upstream connection and emit a synthetic SSE error frame to
+    /// the agent identifying the rule.
+    BlockMidStream(Verdict),
+}
+
+/// State for streaming responses. Created by
+/// [`LlmProxy::response_filter_stream_init`] when an upstream
+/// response is detected to be `text/event-stream`. Subsequent
+/// chunks are fed to [`LlmProxy::response_body_filter`].
+///
+/// The state is `Send + Sync` and held inside a `Mutex` so the
+/// driver can poll it from a streaming task without holding a
+/// borrow on the protocol implementation.
+pub type StreamingState = Arc<Mutex<dyn StreamingProtocolState>>;
+
+/// Per-protocol streaming state.
+///
+/// Anthropic uses [`crate::proxy::protocols::anthropic::AnthropicStreamingState`];
+/// OpenAI and Gemini will provide their own. The driver only sees
+/// this opaque trait.
+pub trait StreamingProtocolState: Send + Sync {
+    /// Feed a chunk of upstream bytes. Returns the action the driver
+    /// should take for this chunk.
+    fn feed_chunk(
+        &mut self,
+        state: &ProxyState,
+        ctx: &ProxyContext,
+        chunk: &[u8],
+    ) -> anyhow::Result<BodyFilterAction>;
+
+    /// Called once when the upstream stream ends cleanly. Used to
+    /// flush any pending events to the audit log.
+    fn finish(
+        &mut self,
+        state: &ProxyState,
+        ctx: &ProxyContext,
+    ) -> anyhow::Result<()>;
+}
+
 /// The contract every protocol must satisfy.
 ///
 /// Implementations are stateless across requests; per-request state
-/// lives in [`ProxyContext`]. Hooks correspond to the lifecycle
-/// stages described in RFC-0001 §"Lifecycle hooks".
+/// lives in [`ProxyContext`] for non-streaming hooks and in
+/// [`StreamingProtocolState`] for streaming.
 #[async_trait]
 pub trait LlmProxy: Send + Sync {
     /// Stable identifier for the protocol, used in audit logs.
@@ -71,9 +125,6 @@ pub trait LlmProxy: Send + Sync {
 
     /// Inspect the inbound (agent → upstream) request, run outbound
     /// rules, and decide whether to forward.
-    ///
-    /// Returns `Continue` to proceed to upstream, `ShortCircuit` to
-    /// reply directly without contacting the upstream.
     async fn request_filter(
         &self,
         ctx: &mut ProxyContext,
@@ -82,34 +133,40 @@ pub trait LlmProxy: Send + Sync {
         body: &Bytes,
     ) -> anyhow::Result<HookOutcome>;
 
-    /// Inspect a fully-buffered upstream response and decide whether
-    /// to forward the bytes unchanged or replace them with a block
-    /// notice.
-    ///
-    /// In v0.2 this hook will be replaced for streaming responses
-    /// with a `response_body_filter` that operates per-chunk. v0.1
-    /// shipped only this buffered path; v0.2-step1 preserves it.
+    /// Inspect a fully-buffered upstream response. Called when the
+    /// upstream content type is **not** `text/event-stream`.
     async fn response_filter(
         &self,
         ctx: &mut ProxyContext,
         state: &ProxyState,
-        upstream_status: axum::http::StatusCode,
+        upstream_status: StatusCode,
         upstream_headers: &HeaderMap,
         body: &Bytes,
     ) -> anyhow::Result<ResponseAction>;
-}
 
-/// Outcome of `response_filter`.
-pub enum ResponseAction {
-    /// Forward the upstream response to the agent unchanged.
-    Forward,
-    /// Replace the response with a block notice carrying the verdict.
-    Block(Verdict),
+    /// Build per-protocol streaming state for an SSE response.
+    ///
+    /// The driver calls this when the upstream response carries
+    /// `Content-Type: text/event-stream`. Each subsequent chunk is
+    /// fed to the returned state via
+    /// [`StreamingProtocolState::feed_chunk`].
+    ///
+    /// The default implementation returns `None`, meaning the
+    /// protocol does not yet support streaming inspection — the
+    /// driver will pass bytes through unchanged.
+    fn response_filter_stream_init(
+        &self,
+        _ctx: &ProxyContext,
+        _state: &ProxyState,
+        _upstream_headers: &HeaderMap,
+    ) -> Option<StreamingState> {
+        None
+    }
 }
 
 /// Build the canonical 403 block response sent to the agent when a
-/// rule fires. Used by both `request_filter` short-circuits and
-/// `response_filter` blocks.
+/// rule fires. Used by `request_filter` short-circuits and the
+/// non-streaming `response_filter` block path.
 pub fn blocked_response(rule_id: &str, reason: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
@@ -120,7 +177,7 @@ pub fn blocked_response(rule_id: &str, reason: &str) -> Response {
         }
     });
     let mut resp = Response::new(Body::from(body.to_string()));
-    *resp.status_mut() = axum::http::StatusCode::FORBIDDEN;
+    *resp.status_mut() = StatusCode::FORBIDDEN;
     resp.headers_mut().insert(
         "content-type",
         axum::http::HeaderValue::from_static("application/json"),
@@ -130,4 +187,23 @@ pub fn blocked_response(rule_id: &str, reason: &str) -> Response {
         axum::http::HeaderValue::from_static("1"),
     );
     resp
+}
+
+/// Build a synthetic SSE error frame to splice into a streaming
+/// response when a rule fires mid-stream. The agent sees a
+/// well-formed `error` event so it can fail gracefully.
+pub fn streaming_block_frame(rule_id: &str, reason: &str) -> Bytes {
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "relix_blocked",
+            "rule_id": rule_id,
+            "message": format!("Relix blocked this stream: {reason}"),
+        }
+    });
+    let frame = format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
+    Bytes::from(frame)
 }
