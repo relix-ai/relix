@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
-    let app = Router::new().route("/{*path}", any(handler));
+    let app = Router::new().route("/*path", any(handler));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9999));
     info!(%addr, "poisoned relay listening (demo only)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
