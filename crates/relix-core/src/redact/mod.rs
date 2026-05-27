@@ -15,9 +15,11 @@
 pub mod config;
 pub mod detector;
 pub mod placeholder;
+pub mod restore;
 pub mod vault;
 
 pub use config::RedactConfig;
 pub use detector::{detect, Detection, SecretKind};
 pub use placeholder::{Placeholder, PlaceholderId};
+pub use restore::{StreamRestore, StreamRestoreStep};
 pub use vault::Vault;

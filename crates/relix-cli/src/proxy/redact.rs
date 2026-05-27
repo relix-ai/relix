@@ -184,7 +184,7 @@ async fn redact_string(
     for h in &hits {
         let real = &s[h.start..h.end];
         let kind = pick_kind(h.kind, real);
-        let p = vault.insert(real, kind).await;
+        let p = vault.insert(real, kind);
         placeholders.push((h.start, h.end, p.render()));
         *count += 1;
     }
@@ -202,14 +202,64 @@ async fn redact_string(
     Some(out)
 }
 
-/// `Generic` is the entropy-fallback kind. When detection lands
-/// on it but the matched value happens to look like a known
-/// shape (e.g. a `Bearer`-like token shape that did not carry
-/// the `Bearer ` prefix), we promote it. v0.3 keeps this simple:
-/// no promotion. Hook is here so future heuristics have a
-/// natural place to live.
+/// `Generic` is the entropy-fallback kind. v0.3 keeps this as
+/// identity; future heuristics that promote a Generic hit to a
+/// more specific kind have a natural place to live here.
 fn pick_kind(kind: SecretKind, _real: &str) -> SecretKind {
     kind
+}
+
+/// Iterate over every placeholder in `s`, yielding `(byte_range,
+/// placeholder)`. Non-overlapping, left-to-right.
+pub fn detect_upstream_leak(state: &ProxyState, body: &[u8]) -> Option<LeakReport> {
+    if !state.redact_config.enabled || !state.redact_config.block_on_upstream_leak {
+        return None;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return None;
+    };
+    let cfg = state.redact_config.detector();
+    let hits = relix_core::redact::detector::detect(text, &cfg);
+    if hits.is_empty() {
+        return None;
+    }
+    // Filter out anything that is itself a placeholder span — those
+    // are ours and not a leak.
+    let placeholder_ranges = relix_core::redact::Placeholder::find_all(text);
+    let mut leak_kinds: Vec<SecretKind> = Vec::new();
+    'outer: for h in &hits {
+        for (range, _) in &placeholder_ranges {
+            if h.start >= range.start && h.end <= range.end {
+                continue 'outer;
+            }
+        }
+        leak_kinds.push(h.kind);
+    }
+    if leak_kinds.is_empty() {
+        return None;
+    }
+    Some(LeakReport { kinds: leak_kinds })
+}
+
+/// Outcome of an upstream-leak scan.
+pub struct LeakReport {
+    pub kinds: Vec<SecretKind>,
+}
+
+impl LeakReport {
+    pub fn rule_id(&self) -> &'static str {
+        "relix.redact.upstream-leak"
+    }
+    pub fn reason(&self) -> String {
+        format!(
+            "upstream returned a literal secret (kind={})",
+            self.kinds
+                .iter()
+                .map(|k| k.label())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -349,7 +399,7 @@ mod tests {
         // the redact path used. Look it up via the vault and
         // verify the round-trip.
         let id = relix_core::redact::placeholder::PlaceholderId::derive(&real, &state.vault.salt());
-        let restored = state.vault.lookup(id).await.expect("vault hit");
+        let restored = state.vault.lookup(id).expect("vault hit");
         assert_eq!(restored.value, real);
     }
 }

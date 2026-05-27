@@ -106,6 +106,27 @@ impl LlmProxy for AnthropicProtocol {
         _upstream_headers: &HeaderMap,
         body: &Bytes,
     ) -> anyhow::Result<ResponseAction> {
+        // RFC-0004 S4: scan the upstream response for literal real
+        // secret values. A response carrying a real key is either
+        // a leak from a misbehaving upstream or active reverse
+        // poisoning. Block-on-leak is on by default.
+        if let Some(leak) = crate::proxy::redact::detect_upstream_leak(state, body) {
+            let verdict = relix_core::Verdict {
+                decision: relix_core::Decision::Block {
+                    rule_id: leak.rule_id().to_string(),
+                    reason: leak.reason(),
+                },
+                matches: vec![],
+            };
+            let event = InspectionEvent::new(
+                ctx.session_id,
+                HttpDirection::Response,
+                ctx.upstream_host.clone(),
+            );
+            state.audit.record(&event, &verdict);
+            return Ok(ResponseAction::Block(verdict));
+        }
+
         let mut event = InspectionEvent::new(
             ctx.session_id,
             HttpDirection::Response,

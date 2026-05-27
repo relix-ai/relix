@@ -108,6 +108,14 @@ impl PlaceholderId {
         }
         Some(Self(out))
     }
+
+    /// Construct directly from raw bytes. Intended for tests; the
+    /// production code path always derives ids via [`Self::derive`]
+    /// so the salt is correctly applied.
+    #[doc(hidden)]
+    pub fn from_bytes(bytes: [u8; ID_BYTES]) -> Self {
+        Self(bytes)
+    }
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {

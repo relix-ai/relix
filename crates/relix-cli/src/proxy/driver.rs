@@ -199,7 +199,18 @@ async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response
                 Ok(blocked_response("relix.unknown", "blocked"))
             }
         }
-        ResponseAction::Forward => forward_buffered(status, &resp_headers_orig, resp_bytes),
+        ResponseAction::Forward => {
+            // RFC-0004 S4: restore placeholders in buffered
+            // responses too. Same `StreamRestore` state machine
+            // works on a single shot.
+            let restored_bytes = restore_buffered(&state, resp_bytes);
+            forward_buffered(
+                status,
+                &resp_headers_orig,
+                restored_bytes,
+                ctx.redacted_count,
+            )
+        }
     }
 }
 
@@ -215,6 +226,7 @@ fn forward_buffered(
     status: StatusCode,
     upstream_headers: &HeaderMap,
     body: Bytes,
+    redacted_count: u32,
 ) -> anyhow::Result<Response> {
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_headers.iter() {
@@ -223,7 +235,29 @@ fn forward_buffered(
         }
         builder = builder.header(name.clone(), value.clone());
     }
+    if redacted_count > 0 {
+        builder = builder.header("x-relix-redacted-count", redacted_count.to_string());
+    }
     Ok(builder.body(Body::from(body))?)
+}
+
+/// Restore placeholders in a buffered response body. Best-effort:
+/// non-UTF-8 bodies pass through unchanged. Vault misses leave the
+/// placeholder untouched (RFC-0004 S05 forged placeholder).
+fn restore_buffered(state: &ProxyState, body: Bytes) -> Bytes {
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return body;
+    };
+    let mut sr = relix_core::redact::StreamRestore::new();
+    let step = sr.step(text, |p| state.vault.lookup(p.id).map(|r| r.value));
+    let tail = sr.finish();
+    if step.emit.is_empty() && tail.is_empty() && step.restored_count == 0 {
+        return body;
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&step.emit);
+    out.push_str(&tail);
+    Bytes::from(out)
 }
 
 /// Forward a streaming SSE response to the agent without inspection.
@@ -276,10 +310,12 @@ where
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
 
     let state = Arc::new(state);
+    let ctx_redacted_count = ctx.redacted_count;
     let ctx = Arc::new(ctx);
 
     tokio::spawn(async move {
         let mut upstream_body = upstream_body;
+        let mut restore = relix_core::redact::StreamRestore::new();
         while let Some(chunk_result) = upstream_body.next().await {
             let chunk = match chunk_result {
                 Ok(b) => b,
@@ -316,7 +352,23 @@ where
 
                 match action {
                     BodyFilterAction::Forward => {
-                        if tx.send(Ok(slice)).await.is_err() {
+                        // RFC-0004 S4: restore placeholders that
+                        // the model echoed back. The restore step
+                        // is best-effort over UTF-8; non-UTF-8
+                        // chunks pass through unchanged because
+                        // the placeholder grammar is ASCII.
+                        let to_send = match std::str::from_utf8(&slice) {
+                            Ok(s) => {
+                                let step =
+                                    restore.step(s, |p| state.vault.lookup(p.id).map(|r| r.value));
+                                Bytes::from(step.emit)
+                            }
+                            Err(_) => slice,
+                        };
+                        if to_send.is_empty() {
+                            continue;
+                        }
+                        if tx.send(Ok(to_send)).await.is_err() {
                             // Downstream went away. Stop forwarding.
                             return;
                         }
@@ -335,6 +387,12 @@ where
             }
         }
 
+        // Flush any held-back tail from the restore state machine.
+        let tail = restore.finish();
+        if !tail.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(tail))).await;
+        }
+
         // Upstream finished cleanly. Let the protocol flush.
         let mut guard = stream_state.lock().await;
         if let Err(err) = guard.finish(&state, &ctx) {
@@ -349,6 +407,13 @@ where
             continue;
         }
         builder = builder.header(name.clone(), value.clone());
+    }
+    // RFC-0004: surface the outbound-redact count to the client so
+    // IDE plugins / power users can show transparency. Inbound
+    // restore counts are not surfaced in the streaming header
+    // (would require trailers); they are recorded via trace logs.
+    if ctx_redacted_count > 0 {
+        builder = builder.header("x-relix-redacted-count", ctx_redacted_count.to_string());
     }
     Ok(builder.body(body)?)
 }
