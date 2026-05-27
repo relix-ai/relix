@@ -52,6 +52,29 @@ const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The client is cheap to clone (it is internally reference-counted)
 /// and is intended to be created once at process start.
 pub fn build() -> Result<reqwest::Client> {
+    build_with(BuildOptions::default())
+}
+
+/// Options for [`build_with`]. The defaults match the production
+/// hardening profile (`https_only = true`); test fixtures opt out of
+/// `https_only` so they can talk to in-process `http://127.0.0.1`
+/// upstreams without compromising the production default.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildOptions {
+    /// When `true` (the production default), reqwest synchronously
+    /// rejects any non-`https://` upstream URL. Set to `false` only
+    /// in test fixtures.
+    pub https_only: bool,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self { https_only: true }
+    }
+}
+
+/// Build the upstream client with the given [`BuildOptions`].
+pub fn build_with(opts: BuildOptions) -> Result<reqwest::Client> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         // No `.timeout()` — see module docs.
@@ -61,7 +84,7 @@ pub fn build() -> Result<reqwest::Client> {
         .tcp_keepalive(TCP_KEEPALIVE)
         .http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
         .http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
-        .https_only(true)
+        .https_only(opts.https_only)
         .build()?;
     Ok(client)
 }
@@ -108,5 +131,13 @@ mod tests {
             err.is_builder(),
             "expected reqwest builder error from https_only, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn default_options_keep_https_only_on() {
+        // Regression guard: if a future change flips the default, the
+        // production build path silently downgrades. Force the call
+        // site to opt out explicitly via BuildOptions.
+        assert!(BuildOptions::default().https_only);
     }
 }

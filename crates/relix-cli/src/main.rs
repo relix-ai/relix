@@ -1,21 +1,14 @@
-mod audit;
-mod cli;
-mod proxy;
-mod rules_loader;
-
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::routing::any;
-use axum::Router;
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::audit::AuditLog;
-use crate::cli::{Cli, Command};
-use crate::proxy::{proxy_handler, ProxyState};
-use crate::rules_loader::{expand_tilde, load_rules};
+use relix_cli::audit::AuditLog;
+use relix_cli::cli::{Cli, Command};
+use relix_cli::rules_loader::{expand_tilde, load_rules};
+use relix_cli::{app_router, ProxyState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,8 +51,7 @@ async fn start(
 
     let audit = AuditLog::open(expand_tilde(&audit_path)).await?;
 
-    let client = crate::proxy::client::build()?;
-
+    let client = relix_cli::proxy::client::build()?;
     let state = ProxyState {
         upstream,
         client,
@@ -67,10 +59,7 @@ async fn start(
         audit,
     };
 
-    let app = Router::new()
-        .route("/", any(proxy_handler))
-        .route("/{*path}", any(proxy_handler))
-        .with_state(state);
+    let app = app_router(state);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
