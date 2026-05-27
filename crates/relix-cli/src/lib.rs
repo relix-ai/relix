@@ -41,12 +41,16 @@ pub async fn build_state(
     upstream: String,
     rules: relix_core::RuleSet,
     audit: AuditLog,
+    redact_config: relix_core::RedactConfig,
 ) -> Result<ProxyState> {
     let client = crate::proxy::client::build()?;
+    let vault = relix_core::Vault::with_fresh_salt(redact_config.vault_cap);
     Ok(ProxyState {
         upstream,
         client,
         rules: Arc::new(rules),
         audit,
+        vault,
+        redact_config: Arc::new(redact_config),
     })
 }

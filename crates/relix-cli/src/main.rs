@@ -51,12 +51,24 @@ async fn start(
 
     let audit = AuditLog::open(expand_tilde(&audit_path)).await?;
 
+    let mut redact_config = relix_core::RedactConfig::default();
+    if let Err(e) = redact_config.apply_env() {
+        warn!(error = %e, "invalid RELIX_REDACT_* env, using defaults");
+        redact_config = relix_core::RedactConfig::default();
+    }
+    if !redact_config.enabled {
+        warn!("secret redaction is DISABLED via configuration");
+    }
+
     let client = relix_cli::proxy::client::build()?;
+    let vault = relix_core::Vault::with_fresh_salt(redact_config.vault_cap);
     let state = ProxyState {
         upstream,
         client,
         rules: Arc::new(ruleset),
         audit,
+        vault,
+        redact_config: Arc::new(redact_config),
     };
 
     let app = app_router(state);

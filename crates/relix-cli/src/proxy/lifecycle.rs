@@ -35,6 +35,15 @@ pub struct ProxyContext {
     pub method: Method,
     pub uri: Uri,
     pub upstream_host: String,
+    /// If `request_filter` rewrites the outbound body (e.g. for
+    /// secret redaction per RFC-0004), it stores the new body here
+    /// and the driver forwards the rewritten bytes upstream instead
+    /// of the original. `None` means "forward original".
+    pub replaced_body: Option<Bytes>,
+    /// Number of secrets the redactor replaced on the outbound
+    /// request. Used to set the `x-relix-redacted-count` response
+    /// header on the way back. `0` means absent.
+    pub redacted_count: u32,
 }
 
 impl ProxyContext {
@@ -44,6 +53,8 @@ impl ProxyContext {
             method,
             uri,
             upstream_host,
+            replaced_body: None,
+            redacted_count: 0,
         }
     }
 }

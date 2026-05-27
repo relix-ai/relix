@@ -142,6 +142,13 @@ impl Vault {
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
+
+    /// Borrow the per-process salt. Exposed so the integration
+    /// layer (and tests) can derive a [`PlaceholderId`] from a
+    /// known real value without going through the vault.
+    pub fn salt(&self) -> Salt {
+        self.salt
+    }
 }
 
 /// The materialised restore result. We deliberately yield a

@@ -58,11 +58,15 @@ pub async fn spawn_proxy(rules: RuleSet, upstream_url: String) -> TestServer {
         https_only: false,
     })
     .expect("build test client");
+    let redact_config = relix_core::RedactConfig::default();
+    let vault = relix_core::Vault::with_fresh_salt(redact_config.vault_cap);
     let state = ProxyState {
         upstream: upstream_url,
         client,
         rules: Arc::new(rules),
         audit,
+        vault,
+        redact_config: Arc::new(redact_config),
     };
     spawn_router(app_router(state)).await
 }

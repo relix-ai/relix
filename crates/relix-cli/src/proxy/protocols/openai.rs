@@ -27,7 +27,18 @@ use crate::proxy::lifecycle::{
     blocked_response, BodyFilterAction, HookOutcome, LlmProxy, ProxyContext, ResponseAction,
     StreamingProtocolState, StreamingState,
 };
+use crate::proxy::redact::{redact_outbound, RedactPaths};
 use crate::proxy::state::ProxyState;
+
+/// JSON paths the redactor walks in an OpenAI Chat Completions
+/// request body. OpenAI only carries text in `messages[]`; there is
+/// no top-level `system` field (system text lives in
+/// `messages[role:"system"]`).
+const REDACT_PATHS: RedactPaths = RedactPaths {
+    top_level_strings: &[],
+    top_level_text_arrays: &[],
+    walk_messages: true,
+};
 
 pub struct OpenAiProtocol;
 
@@ -44,7 +55,16 @@ impl LlmProxy for OpenAiProtocol {
         _headers: &HeaderMap,
         body: &Bytes,
     ) -> anyhow::Result<HookOutcome> {
-        let system_prompt = extract_system_prompt(body);
+        let outcome = redact_outbound(state, &REDACT_PATHS, body).await;
+        let body_for_inspection = if outcome.count > 0 {
+            ctx.redacted_count = outcome.count;
+            ctx.replaced_body = Some(outcome.body.clone());
+            outcome.body
+        } else {
+            body.clone()
+        };
+
+        let system_prompt = extract_system_prompt(&body_for_inspection);
 
         let event = InspectionEvent::new(
             ctx.session_id,

@@ -136,13 +136,21 @@ async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response
         HookOutcome::Continue => {}
     }
 
+    // If the protocol's request_filter rewrote the body (e.g. for
+    // RFC-0004 secret redaction), forward the rewritten bytes
+    // upstream and recompute Content-Length implicitly via reqwest.
+    let outbound_body = ctx.replaced_body.clone().unwrap_or(body_bytes);
+
     // Stage 2: forward to upstream
     let mut upstream_req = state
         .client
         .request(parts.method.clone(), upstream_url)
-        .body(body_bytes);
+        .body(outbound_body);
     for (name, value) in parts.headers.iter() {
         let lname = name.as_str().to_ascii_lowercase();
+        // Drop content-length when the body changed; reqwest sets
+        // it from the new body. Otherwise the upstream sees the
+        // pre-redaction length and rejects the request.
         if matches!(lname.as_str(), "host" | "content-length" | "connection") {
             continue;
         }

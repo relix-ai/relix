@@ -8,11 +8,13 @@
 //! - [`lifecycle`] — `LlmProxy` trait modeled on Pingora's `ProxyHttp`
 //! - [`driver`] — axum handler that drives the lifecycle
 //! - [`protocols`] — concrete per-provider implementations
+//! - [`redact`] — secret redaction integration (RFC-0004)
 
 pub mod client;
 pub mod driver;
 pub mod lifecycle;
 pub mod protocols;
+pub mod redact;
 pub mod state;
 pub mod url;
 
