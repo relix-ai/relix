@@ -251,6 +251,56 @@ response. Absent if zero.
 
 Each step lands as its own PR with its own tests.
 
+## Red-team review (post-S5 self-audit)
+
+After landing all five stages the residual gaps below were
+identified. R-A through R-C are flagged for v0.4; the rest are
+either resolved (R-D) or out of scope.
+
+### R-A: nested JSON-escape levels
+
+The placeholder regex accepts at most one `\` before each inner
+quote (`\\?"`). A response body that wraps a JSON inside another
+JSON string would render the placeholder as `\\\"...\\\"` (two
+backslashes), and we would miss it. Currently no observed
+upstream double-encodes responses, but we should support
+`\\*"` semantically (any escape depth) once a real-world case
+appears. Fix: allow the regex to match `\*` and verify
+roundtrip when the upstream is known to multi-encode.
+
+### R-B: streaming + JSON escape interaction
+
+Anthropic SSE delivers `tool_use.input` as `partial_json`
+strings — placeholders inside those fields will already be
+`\"`-escaped on the wire. The `StreamRestore` state machine
+only knows about literal placeholders. If the model echoes a
+placeholder back in a tool_use argument, we currently do not
+restore it inside the SSE frame. Fix: surface the JSON-decoded
+view of partial_json fragments to the restore step, then
+re-encode after substitution.
+
+### R-C: detector false positives on response path
+
+`detect_upstream_leak` flags any response substring matching
+the detector corpus that is not already wrapped in a
+`<RELIX_SECRET>` placeholder. A model that _invents_ a string
+that coincidentally matches one of our regexes would trigger
+a false-positive block. Real risk is low (the corpus is
+specific) but the cost is request blocked. Mitigations to
+consider: only block on shapes that derive deterministically
+(AKIA, ghp\_, JWT) and downgrade entropy-fallback hits to a
+warning.
+
+### R-D: salt rotation across process restart (resolved as designed)
+
+Salts are per-process. After a restart, the model can no
+longer reference placeholders from the previous run because
+they will lookup-miss. This is intentional: the alternative
+(persisting the salt + vault) brings key-management
+complexity that v0.3 deliberately avoids. The cost is the
+user has to repaste secrets after a Relix restart. Reopen
+when a real workflow makes this painful.
+
 ## Open questions
 
 None at draft time. Configuration knobs absorb all the points
