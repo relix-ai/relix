@@ -3,6 +3,7 @@
 //! Layered as described in `docs/rfcs/0001-multi-protocol-gateway.md`:
 //!
 //! - [`client`] — upstream `reqwest::Client` construction (timeouts, TLS, pool)
+//! - [`url`] — upstream URL construction and inbound URI sanitisation
 //! - [`state`] — shared `ProxyState`
 //! - [`lifecycle`] — `LlmProxy` trait modeled on Pingora's `ProxyHttp`
 //! - [`driver`] — axum handler that drives the lifecycle
@@ -13,6 +14,7 @@ pub mod driver;
 pub mod lifecycle;
 pub mod protocols;
 pub mod state;
+pub mod url;
 
 pub use driver::proxy_handler;
 pub use state::ProxyState;

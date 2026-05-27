@@ -62,16 +62,41 @@ pub async fn proxy_handler(
 async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
 
-    let upstream_host = url::Url::parse(&state.upstream)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
+    // RFC-0003 H4: classify the inbound path before contacting the
+    // upstream. Unsafe paths (path traversal, encoded slashes,
+    // control bytes, etc.) are rejected with 400 *here*, never
+    // forwarded. The classifier is also used downstream by the
+    // protocol selector but is checked again at URL construction
+    // time as defence in depth.
+    match crate::proxy::url::classify_path(parts.uri.path()) {
+        crate::proxy::url::PathDecision::Reject(reason) => {
+            warn!(path = %parts.uri.path(), %reason, "rejecting unsafe inbound path");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("x-relix-error", "unsafe-path")
+                .body(Body::from(format!(
+                    r#"{{"error":"relix_unsafe_path","message":"{reason}"}}"#
+                )))
+                .unwrap());
+        }
+        crate::proxy::url::PathDecision::AllowedKnown
+        | crate::proxy::url::PathDecision::AllowedUnknown => {}
+    }
+
+    // Parse the upstream base once. A misconfigured upstream URL
+    // is a fatal config bug, not a per-request error; surface 502
+    // and let the operator fix it.
+    let upstream_base = ::url::Url::parse(&state.upstream)
+        .map_err(|e| anyhow::anyhow!("invalid RELIX_UPSTREAM '{}': {e}", state.upstream))?;
+    let upstream_host = upstream_base
+        .host_str()
+        .map(str::to_string)
         .unwrap_or_else(|| "unknown".into());
 
-    let upstream_url = format!(
-        "{}{}",
-        state.upstream.trim_end_matches('/'),
-        parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("")
-    );
+    let upstream_url =
+        crate::proxy::url::build_upstream_url(&upstream_base, &parts.uri).map_err(|e| {
+            anyhow::anyhow!("upstream URL construction rejected inbound URI: {e}")
+        })?;
 
     let mut ctx = ProxyContext::new(parts.method.clone(), parts.uri.clone(), upstream_host);
     let protocol = protocols::select(&parts.uri);
@@ -95,7 +120,7 @@ async fn drive(state: ProxyState, req: Request<Body>) -> anyhow::Result<Response
     // Stage 2: forward to upstream
     let mut upstream_req = state
         .client
-        .request(parts.method.clone(), &upstream_url)
+        .request(parts.method.clone(), upstream_url)
         .body(body_bytes);
     for (name, value) in parts.headers.iter() {
         let lname = name.as_str().to_ascii_lowercase();
