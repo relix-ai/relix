@@ -44,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Errors
 anyhow = "1"
 thiserror = "1"
+async-trait = "0.1"
 
 # Utilities
 bytes = "1"
