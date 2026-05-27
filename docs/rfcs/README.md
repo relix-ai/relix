@@ -7,9 +7,11 @@ here before code lands in a milestone branch.
 
 ## Index
 
-| ID   | Title                                                                 | Status | Target |
-| ---- | --------------------------------------------------------------------- | ------ | ------ |
-| 0001 | [Multi-protocol gateway architecture](0001-multi-protocol-gateway.md) | Draft  | v0.2   |
+| ID   | Title                                                                 | Status | Target            |
+| ---- | --------------------------------------------------------------------- | ------ | ----------------- |
+| 0001 | [Multi-protocol gateway architecture](0001-multi-protocol-gateway.md) | Draft  | v0.2              |
+| 0002 | [OpenAI protocol adapter](0002-openai-protocol-adapter.md)            | Draft  | v0.2 (step 3)     |
+| 0003 | [Hardening plan](0003-hardening-plan.md)                              | Draft  | v0.2-step3 → v0.3 |
 
 ## Process
 
