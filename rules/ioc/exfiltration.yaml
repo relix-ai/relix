@@ -1,8 +1,13 @@
-# Outbound credential exfiltration patterns.
+# Outbound shell-execution attack patterns.
 #
-# These rules inspect the tool_calls Relix observes inside LLM responses,
-# blocking shell commands that read credential material and pipe it to a
-# remote endpoint.
+# These rules inspect the tool_calls Relix observes inside LLM
+# responses, blocking shell commands that have no legitimate use in
+# an AI coding agent context.
+#
+# Severity convention:
+#   critical = direct remote code execution / reverse shell
+#   high     = installer or payload drop
+#   medium   = obfuscation / interpreter bridges
 
 rules:
   - id: relix.bash.curl-pipe-bash
@@ -15,6 +20,8 @@ rules:
     severity: high
     action: block
     tags: [bash, pipe-to-shell]
+    references:
+      - https://attack.mitre.org/techniques/T1059/004/
     matcher:
       kind: tool_input_regex
       name: Bash
@@ -28,24 +35,13 @@ rules:
       in an AI-coding-agent context.
     severity: high
     action: block
-    tags: [bash, obfuscation]
+    tags: [bash, obfuscation, defense-evasion]
+    references:
+      - https://attack.mitre.org/techniques/T1140/
     matcher:
       kind: tool_input_regex
       name: Bash
       pattern: "base64\\s+-d.*\\|\\s*(bash|sh|python)"
-
-  - id: relix.bash.read-private-key
-    name: shell command reads SSH private key
-    description: |
-      Any tool call that cats, reads, or uploads an SSH private key,
-      AWS credential file, or other key material is highly suspicious.
-    severity: critical
-    action: block
-    tags: [credential-exfiltration, ssh]
-    matcher:
-      kind: tool_input_regex
-      name: Bash
-      pattern: "(\\.ssh/id_(rsa|ed25519|ecdsa)|\\.aws/credentials|\\.env(\\s|$)|/etc/shadow)"
 
   - id: relix.bash.curl-upload-file
     name: curl/wget upload of arbitrary local file
@@ -56,6 +52,8 @@ rules:
     severity: high
     action: block
     tags: [exfiltration]
+    references:
+      - https://attack.mitre.org/techniques/T1041/
     matcher:
       kind: tool_input_regex
       name: Bash
@@ -68,8 +66,150 @@ rules:
       interactive reverse shell to an attacker-controlled host.
     severity: critical
     action: block
-    tags: [reverse-shell]
+    tags: [reverse-shell, command-and-control]
+    references:
+      - https://attack.mitre.org/techniques/T1071/
     matcher:
       kind: tool_input_regex
       name: Bash
       pattern: "(bash\\s+-i\\s*>&\\s*/dev/tcp/|nc\\s+.*-e\\s*(/bin/)?(bash|sh)|python\\s+-c\\s*['\"].*socket\\.\\w+\\(.*connect)"
+
+  - id: relix.bash.python-pty-spawn
+    name: python pty.spawn shell upgrade
+    description: |
+      `python -c "import pty; pty.spawn(['/bin/sh'])"` is the classic
+      upgrade-to-interactive-shell step inside a reverse-shell session.
+    severity: critical
+    action: block
+    tags: [reverse-shell, command-and-control]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "python\\d?\\s+-c\\s*['\"].*pty\\.\\s*spawn"
+
+  - id: relix.bash.eval-from-network
+    name: shell eval of network input
+    description: |
+      `eval "$(curl ...)"` and `source <(curl ...)` are install-time
+      RCEs by another name.
+    severity: critical
+    action: block
+    tags: [bash, pipe-to-shell]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(eval\\s+\"\\$\\((curl|wget)|source\\s+<\\(\\s*(curl|wget))"
+
+  - id: relix.bash.write-to-systemd-unit
+    name: shell command writes a systemd unit
+    description: |
+      Persistence via systemd unit drop is a common implant step.
+    severity: high
+    action: block
+    tags: [persistence]
+    references:
+      - https://attack.mitre.org/techniques/T1543/002/
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "/etc/systemd/system/.*\\.service"
+
+  - id: relix.bash.write-cron-job
+    name: shell command writes a cron job
+    description: |
+      Crontab edits and drops into /etc/cron.d/ are common
+      persistence mechanisms.
+    severity: high
+    action: block
+    tags: [persistence]
+    references:
+      - https://attack.mitre.org/techniques/T1053/003/
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(/etc/cron\\.(d|hourly|daily|weekly|monthly)/|crontab\\s+-)"
+
+  - id: relix.bash.append-authorized-keys
+    name: shell command appends to ~/.ssh/authorized_keys
+    description: |
+      Appending an attacker-controlled key to authorized_keys is the
+      classic ssh-persistence technique.
+    severity: critical
+    action: block
+    tags: [persistence, ssh]
+    references:
+      - https://attack.mitre.org/techniques/T1098/004/
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "\\.ssh/authorized_keys"
+
+  - id: relix.bash.modify-shell-rc
+    name: shell command modifies user shell rc
+    description: |
+      Writing to ~/.bashrc / ~/.zshrc / ~/.profile is a stealthy way
+      to run code on every shell open. Tool calls almost never need
+      to mutate them.
+    severity: high
+    action: block
+    tags: [persistence]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: ">>\\s*~?/?\\.(bashrc|bash_profile|zshrc|profile|zprofile)"
+
+  - id: relix.bash.disable-history
+    name: shell command disables command history
+    description: |
+      `unset HISTFILE`, `set +o history`, and `export HISTSIZE=0` are
+      anti-forensic tells.
+    severity: high
+    action: block
+    tags: [defense-evasion]
+    references:
+      - https://attack.mitre.org/techniques/T1070/003/
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(unset\\s+HISTFILE|set\\s+\\+o\\s+history|export\\s+HISTSIZE\\s*=\\s*0)"
+
+  - id: relix.bash.iptables-flush
+    name: shell command flushes iptables / nftables
+    description: |
+      Disabling host firewall rules opens lateral movement paths
+      and is rarely a legitimate operation.
+    severity: high
+    action: block
+    tags: [defense-evasion, lateral-movement]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(iptables\\s+-F|iptables\\s+--flush|nft\\s+flush\\s+ruleset|ufw\\s+disable)"
+
+  - id: relix.bash.delete-system-logs
+    name: shell command deletes auth/system logs
+    description: |
+      Tampering with /var/log/auth.log, /var/log/syslog, or wtmp
+      is a textbook anti-forensics step.
+    severity: high
+    action: block
+    tags: [defense-evasion, anti-forensics]
+    references:
+      - https://attack.mitre.org/techniques/T1070/002/
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(>\\s*/var/log/(auth|syslog|wtmp|btmp|secure)|rm\\s+-f?\\s+/var/log/(auth|syslog|wtmp|btmp|secure))"
+
+  - id: relix.bash.kernel-module-load
+    name: shell command loads a kernel module
+    description: |
+      `insmod` / `modprobe` of an attacker-supplied module is a
+      kernel-level persistence vector.
+    severity: critical
+    action: block
+    tags: [persistence, privilege-escalation]
+    matcher:
+      kind: tool_input_regex
+      name: Bash
+      pattern: "(insmod\\s+\\S+\\.ko|modprobe\\s+--force)"
