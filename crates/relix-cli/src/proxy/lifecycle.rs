@@ -106,11 +106,7 @@ pub trait StreamingProtocolState: Send + Sync {
 
     /// Called once when the upstream stream ends cleanly. Used to
     /// flush any pending events to the audit log.
-    fn finish(
-        &mut self,
-        state: &ProxyState,
-        ctx: &ProxyContext,
-    ) -> anyhow::Result<()>;
+    fn finish(&mut self, state: &ProxyState, ctx: &ProxyContext) -> anyhow::Result<()>;
 }
 
 /// The contract every protocol must satisfy.
@@ -182,10 +178,8 @@ pub fn blocked_response(rule_id: &str, reason: &str) -> Response {
         "content-type",
         axum::http::HeaderValue::from_static("application/json"),
     );
-    resp.headers_mut().insert(
-        "x-relix-blocked",
-        axum::http::HeaderValue::from_static("1"),
-    );
+    resp.headers_mut()
+        .insert("x-relix-blocked", axum::http::HeaderValue::from_static("1"));
     resp
 }
 

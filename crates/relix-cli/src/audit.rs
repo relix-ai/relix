@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use relix_core::Verdict;
 use relix_core::model::InspectionEvent;
+use relix_core::Verdict;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;

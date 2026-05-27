@@ -19,10 +19,10 @@
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
-use relix_core::Decision;
-use relix_core::InspectionContext;
 use relix_core::model::{HttpDirection, InspectionEvent};
 use relix_core::protocol::AnthropicMessageResponse;
+use relix_core::Decision;
+use relix_core::InspectionContext;
 use relix_core::{AnthropicStreamAssembler, StreamEvent};
 use serde_json::Value;
 use std::sync::Arc;
@@ -30,8 +30,8 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::proxy::lifecycle::{
-    BodyFilterAction, HookOutcome, LlmProxy, ProxyContext, ResponseAction, StreamingProtocolState,
-    StreamingState, blocked_response,
+    blocked_response, BodyFilterAction, HookOutcome, LlmProxy, ProxyContext, ResponseAction,
+    StreamingProtocolState, StreamingState,
 };
 use crate::proxy::state::ProxyState;
 
@@ -177,8 +177,7 @@ impl StreamingProtocolState for AnthropicStreamingState {
                         event: &event,
                         system_prompt: None,
                     };
-                    let verdict =
-                        relix_core::inspect::evaluate(&state.rules, &inspection_ctx);
+                    let verdict = relix_core::inspect::evaluate(&state.rules, &inspection_ctx);
 
                     // Audit record is fire-and-forget; we do not block
                     // the streaming path on the disk write.

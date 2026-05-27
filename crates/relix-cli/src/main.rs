@@ -6,15 +6,15 @@ mod rules_loader;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::Router;
 use axum::routing::any;
+use axum::Router;
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::audit::AuditLog;
 use crate::cli::{Cli, Command};
-use crate::proxy::{ProxyState, proxy_handler};
+use crate::proxy::{proxy_handler, ProxyState};
 use crate::rules_loader::{expand_tilde, load_rules};
 
 #[tokio::main]
@@ -23,7 +23,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Start { port, upstream, rules, audit } => start(port, upstream, rules, audit).await,
+        Command::Start {
+            port,
+            upstream,
+            rules,
+            audit,
+        } => start(port, upstream, rules, audit).await,
         Command::Rules { path } => print_rules(&path),
         Command::Logs { audit } => tail_logs(&audit).await,
     }
